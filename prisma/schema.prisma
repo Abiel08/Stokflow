@@ -1,0 +1,237 @@
+// Schéma Prisma — Logiciel de gestion de stock
+// Base de données : PostgreSQL
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  MANAGER      // Gestionnaire de stock
+  STOREKEEPER  // Magasinier
+  AUDITOR      // Auditeur
+}
+
+enum MovementType {
+  IN              // Entrée
+  OUT             // Sortie
+  TRANSFER        // Transfert
+  DEFECTIVE       // Déclaration de stock défectueux (retire du stock bon état, ajoute au stock défectueux)
+  RESTORE         // Le stock défectueux est remis en bon état (perte annulée)
+  SELL_DEFECTIVE  // Le stock défectueux est vendu directement, à prix réduit (récupération partielle)
+  SCRAP           // Le stock défectueux est mis au rebut (perte totale, sort définitivement du système)
+}
+
+// ─────────────────────────────────────────────
+// Entreprise (config globale, singleton)
+// ─────────────────────────────────────────────
+model Company {
+  id                    String   @id @default(cuid())
+  name                  String
+  logoUrl               String?
+  address               String?
+  phone                 String?
+  email                 String?
+  currency              String   @default("EUR")
+  dateFormat            String   @default("DD/MM/YYYY")
+  taxRate               Decimal  @default(0) @db.Decimal(5, 2)
+  notifyLowStockEmail   Boolean  @default(true)
+  notifyLowStockInApp   Boolean  @default(true)
+  updatedAt             DateTime @updatedAt
+}
+
+// Unités de mesure disponibles pour les produits (kg, litre, unité, carton...)
+model Unit {
+  id   String @id @default(cuid())
+  name String @unique
+}
+
+// ─────────────────────────────────────────────
+// Utilisateurs & rôles
+// ─────────────────────────────────────────────
+model User {
+  id            String            @id @default(cuid())
+  name          String
+  username      String            @unique
+  passwordHash  String
+  role          Role              @default(STOREKEEPER)
+  active        Boolean           @default(true)
+  lastLogin     DateTime?
+  createdAt     DateTime          @default(now())
+
+  // Un magasinier est affecté à un seul entrepôt (un entrepôt peut avoir plusieurs magasiniers)
+  warehouseId   String?
+  warehouse     Warehouse?        @relation("StorekeeperWarehouse", fields: [warehouseId], references: [id])
+
+  movements            Movement[]
+  inventoriesSubmitted InventoryCount[] @relation("InventorySubmittedBy")
+  inventoriesValidated InventoryCount[] @relation("InventoryValidatedBy")
+  logs                 ActivityLog[]
+  managedWarehouses    WarehouseManager[]
+  managedProducts      ProductManager[]
+}
+
+// ─────────────────────────────────────────────
+// Entrepôts
+// ─────────────────────────────────────────────
+model Warehouse {
+  id          String          @id @default(cuid())
+  name        String
+  address     String?
+  capacity    Int             @default(0)
+  managers    WarehouseManager[]
+  active      Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+
+  storekeepers       User[]           @relation("StorekeeperWarehouse")
+  stocks             Stock[]
+  movementsSource    Movement[]       @relation("SourceWarehouse")
+  movementsDest      Movement[]       @relation("DestWarehouse")
+  inventories        InventoryCount[]
+}
+
+// ─────────────────────────────────────────────
+// Catalogue produits
+// ─────────────────────────────────────────────
+model Category {
+  id       String    @id @default(cuid())
+  name     String    @unique
+  products Product[]
+}
+
+model Supplier {
+  id            String    @id @default(cuid())
+  name          String
+  contactName   String?
+  phone         String?
+  email         String?
+  address       String?
+  createdAt     DateTime  @default(now())
+  products      Product[]
+}
+
+model Product {
+  id          String     @id @default(cuid())
+  name        String
+  reference   String     @unique // généré automatiquement (ex: PRD-0001)
+  imageUrl    String?
+  unit        String     @default("unité")
+  buyPrice    Decimal    @default(0) @db.Decimal(10, 2)
+  sellPrice   Decimal    @default(0) @db.Decimal(10, 2)
+  minQty      Int        @default(0)
+  active      Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+
+  categoryId  String?
+  category    Category?  @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  supplierId  String?
+  supplier    Supplier?  @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+
+  stocks       Stock[]
+  movements    Movement[]
+  inventories  InventoryCount[]
+  managers     ProductManager[]
+}
+
+// Relation many-to-many : un entrepôt peut avoir plusieurs responsables,
+// choisis parmi les magasiniers déjà rattachés à cet entrepôt.
+model WarehouseManager {
+  userId      String
+  warehouseId String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  warehouse   Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+
+  @@id([userId, warehouseId])
+}
+
+// Relation many-to-many : un magasinier peut gérer plusieurs produits,
+// et un produit peut être géré par plusieurs magasiniers.
+model ProductManager {
+  userId    String
+  productId String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([userId, productId])
+}
+
+// Quantité d'un produit dans un entrepôt donné
+enum StockCondition {
+  GOOD       // bon état, vendable
+  DEFECTIVE  // défectueux, mis de côté
+}
+
+model Stock {
+  id          String         @id @default(cuid())
+  productId   String
+  warehouseId String
+  condition   StockCondition @default(GOOD)
+  quantity    Int            @default(0)
+
+  product     Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  warehouse   Warehouse      @relation(fields: [warehouseId], references: [id], onDelete: Restrict)
+
+  @@unique([productId, warehouseId, condition])
+}
+
+// ─────────────────────────────────────────────
+// Mouvements de stock (entrée / sortie / transfert)
+// ─────────────────────────────────────────────
+model Movement {
+  id              String       @id @default(cuid())
+  type            MovementType
+  productId       String
+  quantity        Int
+  warehouseId     String       // entrepôt source (ou unique pour IN/OUT)
+  destWarehouseId String?      // rempli uniquement pour TRANSFER
+  unitPrice       Decimal?     @db.Decimal(10, 2) // prix unitaire réellement appliqué (utilisé pour SELL_DEFECTIVE)
+  reason          String?
+  reference       String?      // ex: bon de livraison, n° commande
+  userId          String
+  createdAt       DateTime     @default(now())
+
+  product         Product      @relation(fields: [productId], references: [id])
+  warehouse       Warehouse    @relation("SourceWarehouse", fields: [warehouseId], references: [id])
+  destWarehouse   Warehouse?   @relation("DestWarehouse", fields: [destWarehouseId], references: [id])
+  user            User         @relation(fields: [userId], references: [id])
+}
+
+// ─────────────────────────────────────────────
+// Inventaires
+// ─────────────────────────────────────────────
+model InventoryCount {
+  id              String    @id @default(cuid())
+  productId       String
+  warehouseId     String
+  theoreticalQty  Int
+  countedQty      Int
+  difference      Int
+  submittedById   String
+  validatedById   String?
+  validatedAt     DateTime?
+  createdAt       DateTime  @default(now())
+
+  product         Product   @relation(fields: [productId], references: [id])
+  warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
+  submittedBy     User      @relation("InventorySubmittedBy", fields: [submittedById], references: [id])
+  validatedBy     User?     @relation("InventoryValidatedBy", fields: [validatedById], references: [id])
+}
+
+// ─────────────────────────────────────────────
+// Logs d'activité (traçabilité)
+// ─────────────────────────────────────────────
+model ActivityLog {
+  id        String   @id @default(cuid())
+  userId    String
+  action    String   // ex: "Entrée de stock"
+  module    String   // ex: "Stock", "Produits", "Utilisateurs"
+  detail    String?
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id])
+}
